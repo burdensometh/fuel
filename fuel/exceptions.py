@@ -24,3 +24,15 @@ class MissingInputFiles(Exception):
 
 class NeedURLPrefix(Exception):
     """Raised when a URL is not provided for a file."""
+
+
+class LabelRevisionError(ValueError):
+    """Raised when a versioned label revision is invalid.
+
+    This is raised e.g. when a correction set references unknown stable
+    IDs, contains contradictory labels for the same ID within a single
+    revision, uses a non-incremental version number, or when an unknown
+    revision version is requested. In every case the whole submission is
+    rejected without modifying the label store.
+
+    """

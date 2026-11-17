@@ -8,6 +8,7 @@ Welcome to Fuel's documentation!
    overview
    built_in_datasets
    h5py_dataset
+   versioned_labels
    new_dataset
    extending_fuel
    server
