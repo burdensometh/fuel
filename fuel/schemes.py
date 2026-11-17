@@ -38,6 +38,11 @@ class IterationScheme(object):
        https://docs.python.org/3.3/library/stdtypes.html#iterator-types
 
     """
+    #: Whether the scheme can be checkpointed.  Deterministic, replayable
+    #: schemes set this to ``True``; schemes whose position cannot be
+    #: reconstructed set it to ``False``.
+    checkpoint_supported = None
+
     @abstractmethod
     def get_request_iterator(self):
         """Returns an iterator type."""
@@ -110,6 +115,9 @@ class ConcatenatedScheme(IterationScheme):
     requests (batches or examples).
 
     """
+    #: Sub-scheme positions are not tracked individually.
+    checkpoint_supported = False
+
     def __init__(self, schemes):
         if not len(set(scheme.requests_examples for scheme in schemes)) == 1:
             raise ValueError('all schemes must produce the same type of '
@@ -161,6 +169,9 @@ class ConstantScheme(BatchSizeScheme):
         The number of times to return `batch_size`.
 
     """
+    #: Deterministic and fully described by its configuration.
+    checkpoint_supported = True
+
     def __init__(self, batch_size, num_examples=None, times=None):
         if num_examples and times:
             raise ValueError
@@ -188,6 +199,9 @@ class SequentialScheme(BatchScheme):
     The batch size isn't enforced, so the last batch could be smaller.
 
     """
+    #: Deterministic and fully described by its indices and batch size.
+    checkpoint_supported = True
+
     def get_request_iterator(self):
         return imap(list, partition_all(self.batch_size, self.indices))
 
@@ -213,6 +227,10 @@ class ShuffledScheme(BatchScheme):
     (i.e. in the order of tens of millions).
 
     """
+    #: The order is fully described by the indices, batch size and RNG state,
+    #: all of which a checkpoint records.
+    checkpoint_supported = True
+
     def __init__(self, *args, **kwargs):
         self.rng = kwargs.pop('rng', None)
         if self.rng is None:
@@ -235,6 +253,9 @@ class SequentialExampleScheme(IndexScheme):
     Returns examples in order.
 
     """
+    #: Deterministic and fully described by its indices.
+    checkpoint_supported = True
+
     def get_request_iterator(self):
         return iter_(self.indices)
 
@@ -245,6 +266,9 @@ class ShuffledExampleScheme(IndexScheme):
     Returns examples in random order.
 
     """
+    #: The order is fully described by the indices and RNG state.
+    checkpoint_supported = True
+
     def __init__(self, *args, **kwargs):
         self.rng = kwargs.pop('rng', None)
         if self.rng is None:

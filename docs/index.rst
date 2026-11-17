@@ -12,6 +12,7 @@ Welcome to Fuel's documentation!
    extending_fuel
    server
    caching
+   checkpointing
    api/index
 
 Fuel is a data pipeline framework which provides your machine learning models

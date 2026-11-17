@@ -1,3 +1,4 @@
+import hashlib
 import numbers
 from itertools import product
 from collections import defaultdict
@@ -12,6 +13,41 @@ from fuel.datasets import Dataset
 from fuel.schemes import SequentialExampleScheme
 from fuel.utils import do_not_pickle_attributes, Subset
 from fuel.utils.cache import cache_file
+
+
+def _digest_indices(indices):
+    """Return a stable digest of a sequence of indices for checkpoints."""
+    hasher = hashlib.sha256()
+    hasher.update(numpy.asarray(indices, dtype=numpy.int64).tobytes())
+    return hasher.hexdigest()
+
+
+def _digest_subset(dataset, subset):
+    """Return a digest of the values selected by ``subset`` in ``dataset``.
+
+    Only the first min(num_examples, 64) selected rows are hashed to keep
+    checkpointing cheap; this still detects any realistic edit of the input
+    while avoiding a full pass over multi-gigabyte data sources.
+
+    """
+    num_examples = subset.num_examples
+    if num_examples == 0:
+        return None
+    sample_count = min(num_examples, 64)
+    hasher = hashlib.sha256()
+    for i in range(sample_count):
+        try:
+            value = dataset[subset.list_or_slice[i]]
+        except TypeError:
+            # Slice-based subset: translate the position to the dataset.
+            start, stop, step = subset.slice_to_numerical_args(
+                subset.list_or_slice, subset.original_num_examples)
+            value = dataset[start + i * step]
+        array = numpy.asarray(value)
+        if array.dtype == numpy.object_:
+            array = numpy.asarray(array.tolist())
+        hasher.update(array.tobytes())
+    return hasher.hexdigest()
 
 
 @do_not_pickle_attributes('nodes', 'h5file')
@@ -165,6 +201,9 @@ class H5PYDataset(Dataset):
     interface_version = '0.3'
     _ref_counts = defaultdict(int)
     _file_handles = {}
+
+    #: H5PYDataset can report a faithful consumed position for checkpointing.
+    checkpoint_supported = True
 
     def __init__(self, file_or_path, which_sets, subset=None,
                  load_in_memory=False, driver=None, sort_indices=True,
@@ -450,6 +489,56 @@ class H5PYDataset(Dataset):
                         slice(row['start'], row['stop']), len(h5file[source]))
 
         return subsets
+
+    def input_digest(self):
+        """Return a digest binding this dataset to its exact input.
+
+        The digest covers the file format version, the selected splits and
+        sources, the resolved subsets (so that ``which_sets`` and ``subset``
+        changes are detected), the shape/dtype of the selected data, and a
+        digest of the selected values (so that editing the file in place is
+        detected too).
+
+        Checkpoint restoration compares this digest and refuses to continue
+        when the underlying input or the selection changed.
+
+        """
+        self._out_of_memory_open()
+        try:
+            handle = self._file_handle
+            description = {
+                'interface_version': self.interface_version,
+                'which_sets': sorted(str(s) for s in self.which_sets),
+                'sources': list(self.sources),
+                'subsets': [
+                    {'kind': 'list' if subset.is_list else 'slice',
+                     'num_examples': int(subset.num_examples),
+                     'start': int(subset.list_or_slice.start)
+                     if not subset.is_list else None,
+                     'stop': int(subset.list_or_slice.stop)
+                     if not subset.is_list else None,
+                     'indices_digest': None if not subset.is_list
+                     else _digest_indices(subset.list_or_slice)}
+                    for subset in self.subsets],
+                'sources_layout': {},
+                'content': {},
+            }
+            for source_name, subset in zip(self.sources, self.subsets):
+                dataset = handle[source_name]
+                description['sources_layout'][source_name] = {
+                    'shape': [int(dim) for dim in dataset.shape],
+                    'dtype': str(dataset.dtype),
+                    'split_rows': sorted(
+                        [row['split'].decode('utf8'),
+                         int(row['start']), int(row['stop'])]
+                        for row in handle.attrs['split']
+                        if row['source'].decode('utf8') == source_name),
+                }
+                description['content'][source_name] = _digest_subset(
+                    dataset, subset)
+            return description
+        finally:
+            self._out_of_memory_close()
 
     def load(self):
         # If the dataset is unpickled, it makes no sense to have an external

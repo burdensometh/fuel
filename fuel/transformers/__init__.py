@@ -204,6 +204,10 @@ class Mapping(Transformer):
         can be changed to `dict`.
 
     """
+    #: An arbitrary Python callable may be stateful, so the consumed position
+    #: cannot be guaranteed to be reproducible.
+    checkpoint_supported = False
+
     def __init__(self, data_stream, mapping, add_sources=None,
                  mapping_accepts=list, **kwargs):
         super(Mapping, self).__init__(
@@ -462,6 +466,10 @@ class Filter(Transformer):
         Should return ``True`` for the samples to be kept.
 
     """
+    #: The number of consumed examples depends on a predicate and is not
+    #: known in advance, so the consumed position cannot be reconstructed.
+    checkpoint_supported = False
+
     def __init__(self, data_stream, predicate, **kwargs):
         if data_stream.axis_labels:
             kwargs.setdefault('axis_labels', data_stream.axis_labels.copy())
@@ -498,6 +506,9 @@ class Cache(Transformer):
         refilled when needed through the :meth:`get_data` method.
 
     """
+    #: Read-ahead makes the read position differ from the consumed position.
+    checkpoint_supported = False
+
     def __init__(self, data_stream, iteration_scheme, **kwargs):
         # Note: produces_examples will always be False because of this
         # restriction: the only iteration schemes allowed are BatchSizeScheme,
@@ -638,6 +649,10 @@ class Unpack(Transformer):
         The data stream to unpack
 
     """
+    #: The unconsumed remainder of the current batch is held in memory, so
+    #: the read position does not describe the consumed position.
+    checkpoint_supported = False
+
     def __init__(self, data_stream, **kwargs):
         if data_stream.produces_examples:
             raise ValueError('the wrapped data stream must produce batches of '
@@ -769,6 +784,10 @@ class Merge(AbstractDataStream):
     ('Hello world!', 'Bonjour le monde!')
 
     """
+    #: Individual stream positions are not tracked, so the merged position
+    #: cannot be reconstructed.
+    checkpoint_supported = False
+
     def __init__(self, data_streams, sources, axis_labels=None):
         super(Merge, self).__init__(
             iteration_scheme=None, axis_labels=axis_labels)
@@ -868,6 +887,10 @@ class MultiProcessing(Transformer):
     robust approach might need to be considered.
 
     """
+    #: Batches are prefetched in a background process, which is not
+    #: acknowledged in lockstep with the training loop.
+    checkpoint_supported = False
+
     def __init__(self, data_stream, max_store=100, **kwargs):
         if data_stream.axis_labels:
             kwargs.setdefault('axis_labels', data_stream.axis_labels.copy())

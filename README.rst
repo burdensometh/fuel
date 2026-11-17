@@ -25,6 +25,7 @@ Fuel provides your machine learning models with the data they need to learn.
 * The ability to iterate over your data in a variety of ways, such as in minibatches with shuffled/sequential examples
 * A pipeline of preprocessors that allow you to edit your data on-the-fly, for example by adding noise, extracting n-grams from sentences, extracting patches from images, etc.
 * Ensure that the entire pipeline is serializable with pickle; this is a requirement for being able to checkpoint and resume long-running experiments. For this, we rely heavily on the picklable_itertools_ library.
+* Explicit batch acknowledgement and checkpointing for deterministic pipelines, so a training run can be resumed from the batch after the last *consumed* one without skipping or duplicating samples (see the checkpointing section of the documentation).
 
 Fuel is developed primarily for use by Blocks_, a Theano toolkit that helps you train neural networks.
 

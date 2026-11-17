@@ -1,6 +1,8 @@
 import collections
+import hashlib
 from abc import ABCMeta, abstractmethod
 
+import numpy
 from six import add_metaclass
 
 from picklable_itertools import iter_, izip
@@ -8,6 +10,32 @@ from picklable_itertools import iter_, izip
 from fuel.schemes import SequentialExampleScheme
 from fuel.streams import DataStream
 from fuel.utils import Subset
+
+
+def _digest_indexable(indexable):
+    """Return a stable digest of an indexable's length and first values."""
+    try:
+        length = len(indexable)
+    except TypeError:
+        # Iterables without a length cannot be fingerprinted cheaply.
+        return {'length': None}
+    if length == 0:
+        return {'length': 0}
+    sample_count = min(length, 64)
+    hasher = hashlib.sha256()
+    for i in range(sample_count):
+        try:
+            array = numpy.asarray(indexable[i])
+        except Exception:
+            hasher.update(repr(indexable[i]).encode('utf8'))
+            continue
+        if array.dtype == numpy.object_:
+            hasher.update(repr(array.tolist()).encode('utf8'))
+        else:
+            hasher.update(str(array.dtype).encode('utf8'))
+            hasher.update(repr(array.shape).encode('utf8'))
+            hasher.update(array.tobytes())
+    return {'length': int(length), 'digest': hasher.hexdigest()}
 
 
 @add_metaclass(ABCMeta)
@@ -274,6 +302,13 @@ class IterableDataset(Dataset):
     """
     example_iteration_scheme = None
 
+    #: Iterables cannot be fingerprinted or replayed, so they cannot be
+    #: checkpointed.
+    checkpoint_supported = False
+    checkpoint_unsupported_reason = (
+        'its iterables cannot be replayed or fingerprinted, so neither the '
+        'consumed position nor the input identity can be recovered')
+
     def __init__(self, iterables, **kwargs):
         if isinstance(iterables, dict):
             self.provides_sources = tuple(iterables.keys())
@@ -342,6 +377,9 @@ class IndexableDataset(Dataset):
     provide easy access to the data.
 
     """
+    #: IndexableDataset can report a faithful consumed position.
+    checkpoint_supported = True
+
     def __init__(self, indexables, start=None, stop=None, **kwargs):
         if isinstance(indexables, dict):
             self.provides_sources = tuple(indexables.keys())
@@ -380,6 +418,26 @@ class IndexableDataset(Dataset):
     @property
     def num_examples(self):
         return len(self.indexables[0])
+
+    def input_digest(self):
+        """Return a description binding this dataset to its exact input.
+
+        Used by checkpointing to refuse resuming on different data.  The
+        digest covers the sources, their lengths, the selection window and
+        a digest of the underlying values.
+
+        """
+        description = {
+            'class': type(self).__name__,
+            'sources': list(self.sources),
+            'num_examples': int(self.num_examples),
+            'start': self.start,
+            'stop': self.stop,
+            'content': {},
+        }
+        for source, indexable in zip(self.sources, self.indexables):
+            description['content'][source] = _digest_indexable(indexable)
+        return description
 
     def get_data(self, state=None, request=None):
         if state is not None or request is None:
