@@ -2,7 +2,7 @@
 from fuel.datasets.base import (Dataset, IterableDataset,
                                 IndexableDataset)
 
-from fuel.datasets.hdf5 import H5PYDataset
+from fuel.datasets.hdf5 import H5PYDataset, ShardedH5PYDataset
 from fuel.datasets.adult import Adult
 from fuel.datasets.binarized_mnist import BinarizedMNIST
 from fuel.datasets.celeba import CelebA

@@ -1,6 +1,8 @@
 import numbers
+import threading
+from bisect import bisect_right
 from itertools import product
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 import h5py
 import numpy
@@ -590,4 +592,821 @@ class H5PYDataset(Dataset):
                         sort_indices=self.sort_indices))
             else:
                 shapes.append(None)
+        return data, shapes
+
+
+def _dtype_signature(dtype):
+    """Returns a hashable description of an HDF5 dtype.
+
+    :class:`numpy.dtype` equality is not enough on its own: every
+    variable-length dtype is reported as ``object``, so two datasets whose
+    elements have different base types (or ``bytes`` versus ``str``) would
+    otherwise look identical. This helper also covers compound and
+    sub-array dtypes.
+
+    """
+    vlen = h5py.check_dtype(vlen=dtype)
+    if vlen is not None:
+        if isinstance(vlen, numpy.dtype):
+            return ('vlen', 'numpy', vlen.str)
+        return ('vlen', 'python', getattr(vlen, '__name__', str(vlen)))
+    if dtype.subdtype is not None:
+        base, shape = dtype.subdtype
+        return ('subarray', tuple(shape), _dtype_signature(base))
+    if dtype.names is not None:
+        return ('compound', tuple(
+            (name, _dtype_signature(dtype.fields[name][0]))
+            for name in dtype.names))
+    return ('fixed', dtype.str)
+
+
+class _HandlePool(object):
+    """A bounded cache of read-only HDF5 handles.
+
+    Handles are opened on demand and cached, so consecutive requests hitting
+    the same shard do not reopen it. When ``max_open_files`` is reached, the
+    least recently used handle that no request is currently using is closed
+    to make room. A handle in use by a request is never closed by someone
+    else's request.
+
+    """
+    def __init__(self, max_open_files=None):
+        self.max_open_files = max_open_files
+        self._handles = OrderedDict()
+        self._ref_counts = defaultdict(int)
+        self._open_states = 0
+        self._lock = threading.RLock()
+
+    def acquire(self, path, driver=None):
+        """Opens ``path`` if needed, marks it in use and returns its handle."""
+        with self._lock:
+            if path in self._handles:
+                self._handles.move_to_end(path)
+            else:
+                self._evict_if_needed()
+                self._handles[path] = h5py.File(
+                    name=path, mode='r', driver=driver)
+            self._ref_counts[path] += 1
+            return self._handles[path]
+
+    def release(self, path):
+        """Marks ``path`` as no longer used by the calling request."""
+        with self._lock:
+            if not self._ref_counts[path]:
+                return
+            self._ref_counts[path] -= 1
+            if not self._ref_counts[path]:
+                del self._ref_counts[path]
+
+    def _evict_if_needed(self):
+        if (self.max_open_files is None or
+                len(self._handles) < self.max_open_files):
+            return
+        for candidate in list(self._handles):
+            if not self._ref_counts[candidate]:
+                self._handles.pop(candidate).close()
+                return
+        # Every cached handle is in use: exceeding the bound for the moment
+        # is the only option that preserves correctness.
+
+    def open_state(self):
+        with self._lock:
+            self._open_states += 1
+
+    def close_state(self):
+        with self._lock:
+            self._open_states = max(0, self._open_states - 1)
+            if not self._open_states:
+                self._clear_idle()
+
+    def _clear_idle(self):
+        for path in list(self._handles):
+            if not self._ref_counts[path]:
+                self._handles.pop(path).close()
+
+    def close_idle_if_unused(self):
+        """Closes cached handles if no stream is currently open."""
+        with self._lock:
+            if not self._open_states:
+                self._clear_idle()
+
+    def close(self):
+        with self._lock:
+            for handle in self._handles.values():
+                handle.close()
+            self._handles.clear()
+            self._ref_counts.clear()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_handles'] = OrderedDict()
+        state['_ref_counts'] = defaultdict(int)
+        state['_open_states'] = 0
+        state['_lock'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+
+
+class _ShardState(object):
+    """The state of a :class:`ShardedH5PYDataset` stream.
+
+    Handles live in the dataset-wide :class:`_HandlePool` and are only leased
+    for the duration of a request, so this state holds no file reference by
+    itself. Closing one stream therefore cannot close a file another stream
+    is still reading.
+
+    """
+
+    def __init__(self, max_open_files=None):
+        self.max_open_files = max_open_files
+
+    def __getstate__(self):
+        return {'max_open_files': self.max_open_files}
+
+    def __setstate__(self, state):
+        self.max_open_files = state['max_open_files']
+
+
+class ShardedH5PYDataset(Dataset):
+    """A dataset made of several HDF5 files, sampled as a single dataset.
+
+    Every shard is an HDF5 file respecting the :class:`H5PYDataset`
+    interface. Shards are combined in the order in which they are provided,
+    each contributing the examples of the split(s) selected for it. The
+    combined dataset is then sampled like a single :class:`H5PYDataset`:
+    integer, slice and list requests are supported, including lists with
+    duplicated or unsorted indices.
+
+    Requests are indices into the concatenation of the shards. If the first
+    shard contributes 10 examples and the second one 5, index ``12`` is the
+    third example of the second shard. Output always follows the order of the
+    request, and every source of an example (features, labels and
+    variable-length shapes alike) is read from that same example.
+
+    Shards are validated against one another when the dataset is created.
+    They must provide the same sources, with compatible dtypes and axis
+    semantics (axis labels, plus shape labels and dimensionality for
+    variable-length sources and element shapes for fixed-size ones). An
+    incompatible shard raises :class:`ValueError`. A shard contributing no
+    example for its selected split(s) is skipped: it adds nothing to the
+    index and its metadata is not compared with the other shards.
+
+    Data is read from disk on demand, and a request only touches the shards
+    it needs. ``max_open_files`` bounds the number of simultaneously open
+    files.
+
+    Parameters
+    ----------
+    shards : iterable
+        Shards, in order. Each element is either a ``(file_or_path,
+        which_sets)`` pair or a lone ``file_or_path``, in which case the
+        ``which_sets`` argument is used. ``which_sets`` selects the split(s)
+        used *within that shard* and accepts the same values as
+        :class:`H5PYDataset`'s ``which_sets``. A mapping of files to
+        ``which_sets`` is also accepted.
+    subset : {slice, list of int}, optional
+        Which subset of the combined dataset to use. Defaults to `None`, in
+        which case every shard contributes all its selected examples.
+    load_in_memory : bool, optional
+        Whether to load the selected data in main memory. Defaults to
+        `False`.
+    driver : str, optional
+        Low-level h5py driver used to open the shard files. Defaults to
+        `None`.
+    sort_indices : bool, optional
+        Kept for API compatibility with :class:`H5PYDataset`. Duplicated and
+        unsorted indices are always supported; the flag only indicates that
+        reads may be reordered internally. Defaults to `True`.
+    max_open_files : int, optional
+        Maximum number of shard files kept open at once. Defaults to `None`,
+        which means no bound.
+    which_sets : str or tuple of str, optional
+        Split(s) used for shards given without their own ``which_sets``.
+
+    Attributes
+    ----------
+    shards : tuple of (str, tuple of str)
+        The ``(path, which_sets)`` pairs, in order.
+    shard_files : tuple of str
+        Paths of the shards, in order.
+    shard_splits : tuple of tuple of str
+        Splits selected for each shard.
+    shard_num_examples : tuple of int
+        Number of examples contributed by each shard.
+
+    """
+    interface_version = '0.3'
+
+    def __init__(self, shards, subset=None, load_in_memory=False, driver=None,
+                 sort_indices=True, max_open_files=None, which_sets=None,
+                 **kwargs):
+        # Be forgiving about the common ``(shards, which_sets)`` call form:
+        # a string or tuple of strings in second position can only be a
+        # split selection, never a subset.
+        if (which_sets is None and
+                (isinstance(subset, six.string_types) or
+                 (isinstance(subset, tuple) and subset and
+                  all(isinstance(split, six.string_types)
+                      for split in subset)))):
+            which_sets, subset = subset, None
+        if max_open_files is not None:
+            if (not isinstance(max_open_files, numbers.Integral) or
+                    max_open_files < 1):
+                raise ValueError(
+                    '`max_open_files` should be a positive integer or None')
+        self.driver = driver
+        self.sort_indices = sort_indices
+        self.load_in_memory = load_in_memory
+        self.max_open_files = max_open_files
+        self.user_given_subset = subset if subset else slice(None)
+
+        shards = self._normalize_shards(shards, which_sets)
+        if not shards:
+            raise ValueError('`shards` should contain at least one shard')
+
+        self._external_handles = {}
+        self._handle_pool = _HandlePool(max_open_files)
+        self._data_sources = None
+        self._source_shapes = None
+
+        self._parse_shards(shards)
+
+        kwargs.setdefault('axis_labels', self.default_axis_labels)
+        super(ShardedH5PYDataset, self).__init__(**kwargs)
+        self.example_iteration_scheme = SequentialExampleScheme(
+            self.num_examples)
+
+        if self.load_in_memory:
+            self.load()
+
+    # -- Construction --------------------------------------------------------
+
+    @staticmethod
+    def _normalize_which_sets(which_sets):
+        if isinstance(which_sets, six.string_types):
+            return (which_sets,)
+        try:
+            which_sets = tuple(which_sets)
+        except TypeError:
+            raise ValueError('`which_sets` should be an iterable of strings')
+        if not which_sets or not all(
+                isinstance(split, six.string_types) for split in which_sets):
+            raise ValueError('`which_sets` should be an iterable of strings')
+        return which_sets
+
+    def _normalize_shards(self, shards, default_which_sets):
+        if isinstance(shards, six.string_types):
+            raise ValueError(
+                '`shards` should be an iterable of shards, not a string')
+        if isinstance(shards, dict):
+            shards = list(shards.items())
+        else:
+            shards = list(shards)
+        normalized = []
+        for entry in shards:
+            if (isinstance(entry, (tuple, list)) and len(entry) == 2 and
+                    isinstance(entry[0], (six.string_types, h5py.File))):
+                file_or_path, entry_which_sets = entry
+            else:
+                file_or_path, entry_which_sets = entry, default_which_sets
+            if not isinstance(file_or_path, (six.string_types, h5py.File)):
+                raise ValueError(
+                    'shards should be file paths, h5py.File handles or '
+                    '(file, which_sets) pairs')
+            if entry_which_sets is None:
+                raise ValueError(
+                    'no split given for shard {!r}; pass a `(file, '
+                    'which_sets)` pair or the `which_sets` argument'.format(
+                        file_or_path))
+            normalized.append((
+                file_or_path,
+                self._normalize_which_sets(entry_which_sets)))
+        return normalized
+
+    @staticmethod
+    def _open_metadata_handle(file_or_path, path, driver):
+        if isinstance(file_or_path, h5py.File):
+            return file_or_path
+        return h5py.File(name=path, mode='r', driver=driver)
+
+    @staticmethod
+    def _close_metadata_handle(file_or_path, handle):
+        if not isinstance(file_or_path, h5py.File):
+            handle.close()
+
+    @staticmethod
+    def _shard_metadata(handle, which_sets):
+        available_splits = H5PYDataset.get_all_splits(handle)
+        for split in which_sets:
+            if split not in available_splits:
+                raise ValueError(
+                    "'{}' split is not provided by this shard. Available "
+                    "splits are {}.".format(split, available_splits))
+        provided_sources = None
+        for split in which_sets:
+            split_sources = set(
+                H5PYDataset.get_provided_sources(handle, split))
+            if provided_sources is None:
+                provided_sources = split_sources
+            else:
+                provided_sources &= split_sources
+        sources = tuple(sorted(provided_sources))
+        vlen_in_file = set(H5PYDataset.get_vlen_sources(handle))
+        all_axis_labels = H5PYDataset.get_axis_labels(handle)
+        dtypes = {}
+        numpy_dtypes = {}
+        element_shapes = {}
+        vlen_sources = []
+        vlen_shape_shapes = {}
+        axis_labels = {}
+        for source in sources:
+            dataset = handle[source]
+            dtypes[source] = _dtype_signature(dataset.dtype)
+            numpy_dtypes[source] = dataset.dtype
+            element_shapes[source] = tuple(dataset.shape[1:])
+            axis_labels[source] = all_axis_labels[source]
+            if source in vlen_in_file:
+                vlen_sources.append(source)
+                vlen_shape_shapes[source] = tuple(
+                    dataset.dims[0]['shapes'].shape[1:])
+        return {
+            'sources': sources,
+            'dtypes': dtypes,
+            'numpy_dtypes': numpy_dtypes,
+            'element_shapes': element_shapes,
+            'vlen_sources': tuple(sorted(vlen_sources)),
+            'vlen_shape_shapes': vlen_shape_shapes,
+            'axis_labels': axis_labels,
+        }
+
+    @staticmethod
+    def _get_shard_subsets(handle, which_sets, sources):
+        """Returns one :class:`Subset` per source for a shard.
+
+        This mirrors :meth:`H5PYDataset.get_subsets`, but tolerates empty
+        split ranges (which `Subset` rejects) so that shards without any
+        example for the selected split can be skipped cleanly.
+
+        """
+        subsets = [Subset.empty_subset(len(handle[source]))
+                   for source in sources]
+        for split in which_sets:
+            for i, source in enumerate(sources):
+                row, = [r for r in handle.attrs['split'] if
+                        (r['split'].decode('utf8') == split and
+                         r['source'].decode('utf8') == source)]
+                if row['indices']:
+                    subsets[i] += Subset(
+                        handle[row['indices']], len(handle[source]))
+                else:
+                    start, stop = int(row['start']), int(row['stop'])
+                    if start >= stop:
+                        continue
+                    subsets[i] += Subset(
+                        slice(start, stop), len(handle[source]))
+        return subsets
+
+    def _parse_shards(self, shards):
+        shard_files = []
+        shard_splits = []
+        shard_num_examples = []
+        shard_subsets = []
+        reference = None
+        reference_path = None
+
+        for index, (file_or_path, splits) in enumerate(shards):
+            if isinstance(file_or_path, h5py.File):
+                path = file_or_path.filename
+                self._external_handles[index] = file_or_path
+            else:
+                path = cache_file(file_or_path)
+
+            handle = self._open_metadata_handle(file_or_path, path,
+                                                self.driver)
+            try:
+                metadata = self._shard_metadata(handle, splits)
+                subsets = self._get_shard_subsets(
+                    handle, splits, metadata['sources'])
+            finally:
+                self._close_metadata_handle(file_or_path, handle)
+
+            num_examples = subsets[0].num_examples if subsets else 0
+            if any(subset.num_examples != num_examples
+                   for subset in subsets):
+                raise ValueError(
+                    'sources of shard {} have different lengths'.format(path))
+            if num_examples:
+                if reference is None:
+                    reference = metadata
+                    reference_path = path
+                else:
+                    self._check_compatibility(
+                        reference, reference_path, metadata, path)
+
+            shard_files.append(path)
+            shard_splits.append(splits)
+            shard_num_examples.append(num_examples)
+            shard_subsets.append(subsets)
+
+        if reference is None:
+            raise ValueError(
+                'the provided shards contain no example for the selected '
+                'split(s)')
+
+        self.shard_files = tuple(shard_files)
+        self.shard_splits = tuple(shard_splits)
+        self.shard_num_examples = tuple(shard_num_examples)
+        self.shards = tuple(zip(self.shard_files, self.shard_splits))
+
+        self.provides_sources = reference['sources']
+        self.vlen_sources = reference['vlen_sources']
+        self.default_axis_labels = reference['axis_labels']
+        self._numpy_dtypes = reference['numpy_dtypes']
+        self._element_shapes = reference['element_shapes']
+        self._vlen_shape_shapes = reference['vlen_shape_shapes']
+        self._vlen_set = set(self.vlen_sources)
+
+        # `_shard_subsets[source][shard_index]` maps a local example index to
+        # a row of that shard's dataset. Empty shards have no entry, since
+        # they are never read.
+        self._shard_subsets = {}
+        for source in self.provides_sources:
+            source_index = reference['sources'].index(source)
+            self._shard_subsets[source] = [
+                None if not shard_num_examples[index] else
+                shard_subsets[index][source_index]
+                for index in range(len(shard_files))]
+
+        # Cumulative shard boundaries in the combined index space. Empty
+        # shards contribute a zero-length range.
+        self._shard_bounds = []
+        self._shard_starts = []
+        start = 0
+        for num_examples in shard_num_examples:
+            self._shard_bounds.append((start, start + num_examples))
+            self._shard_starts.append(start)
+            start += num_examples
+        self._num_examples_total = start
+
+        # The `subset` argument selects within the combined index space.
+        # `Subset` sorts and de-duplicates list-based subsets, matching
+        # `H5PYDataset`'s documented behaviour.
+        self._user_subset = Subset(
+            self.user_given_subset, self._num_examples_total)
+
+    def _check_compatibility(self, reference, reference_path, candidate,
+                             path):
+        if reference['sources'] != candidate['sources']:
+            raise ValueError(
+                'incompatible shards: shard {} provides sources {} while '
+                'shard {} provides sources {}'.format(
+                    reference_path, reference['sources'], path,
+                    candidate['sources']))
+        if reference['vlen_sources'] != candidate['vlen_sources']:
+            raise ValueError(
+                'incompatible shards: shard {} has variable-length sources '
+                '{} while shard {} has {}'.format(
+                    reference_path, reference['vlen_sources'], path,
+                    candidate['vlen_sources']))
+        for source in reference['sources']:
+            if reference['dtypes'][source] != candidate['dtypes'][source]:
+                raise ValueError(
+                    'incompatible shards: source {} has dtype {} in shard {} '
+                    'but dtype {} in shard {}'.format(
+                        source, reference['dtypes'][source], reference_path,
+                        candidate['dtypes'][source], path))
+            if (reference['axis_labels'][source] !=
+                    candidate['axis_labels'][source]):
+                raise ValueError(
+                    'incompatible shards: source {} has axis labels {} in '
+                    'shard {} but {} in shard {}'.format(
+                        source, reference['axis_labels'][source],
+                        reference_path, candidate['axis_labels'][source],
+                        path))
+            if source in reference['vlen_sources']:
+                if (reference['vlen_shape_shapes'][source] !=
+                        candidate['vlen_shape_shapes'][source]):
+                    raise ValueError(
+                        'incompatible shards: variable-length source {} has '
+                        '{} dimensions in shard {} but {} in shard {}'.format(
+                            source,
+                            len(reference['vlen_shape_shapes'][source]),
+                            reference_path,
+                            len(candidate['vlen_shape_shapes'][source]),
+                            path))
+            elif (reference['element_shapes'][source] !=
+                    candidate['element_shapes'][source]):
+                raise ValueError(
+                    'incompatible shards: source {} has element shape {} in '
+                    'shard {} but {} in shard {}'.format(
+                        source, reference['element_shapes'][source],
+                        reference_path,
+                        candidate['element_shapes'][source], path))
+
+    # -- Pickling ------------------------------------------------------------
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Live file handles and locks cannot be pickled. In-memory data is
+        # dropped so that it is reloaded lazily after unpickling, as with
+        # `H5PYDataset`.
+        state['_external_handles'] = {}
+        state['_handle_pool'] = None
+        state['_data_sources'] = None
+        state['_source_shapes'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._external_handles = {}
+        self._handle_pool = _HandlePool(self.max_open_files)
+
+    # -- Index translation ---------------------------------------------------
+
+    @property
+    def num_examples(self):
+        return self._user_subset.num_examples
+
+    def _translate_request(self, request):
+        """Translates a request into the combined index space.
+
+        Returns a ``(kind, value)`` pair, where ``kind`` is ``'int'``,
+        ``'list'`` or ``'slice'`` and ``value`` is respectively an index, a
+        list of indices in request order, or a ``(start, stop, step)``
+        tuple.
+
+        """
+        subset = self._user_subset
+        if isinstance(request, numbers.Integral):
+            global_index, = subset[[int(request)]]
+            return 'int', int(global_index)
+        translated = subset[request]
+        if isinstance(translated, slice):
+            return 'slice', translated.indices(self._num_examples_total)
+        return 'list', [int(index) for index in translated]
+
+    def _locate(self, global_index):
+        """Maps a combined index to ``(shard_index, local_index)``."""
+        if global_index < 0 or global_index >= self._num_examples_total:
+            raise ValueError(
+                'index {} is out of range for a dataset with {} '
+                'examples'.format(global_index, self._num_examples_total))
+        # Empty shards share their start with the following shard, so
+        # `bisect_right` naturally returns the next non-empty one.
+        shard_index = bisect_right(self._shard_starts, global_index) - 1
+        return shard_index, global_index - self._shard_starts[shard_index]
+
+    @staticmethod
+    def _map_rows(subset, local_indices):
+        """Maps sorted local example indices to rows of a shard dataset."""
+        if subset.is_list:
+            return [int(subset.list_or_slice[index])
+                    for index in local_indices]
+        start, _, step = subset.slice_to_numerical_args(
+            subset.list_or_slice, subset.original_num_examples)
+        if isinstance(local_indices, range):
+            return range(start + step * local_indices.start,
+                         start + step * local_indices.stop,
+                         step * local_indices.step)
+        return [int(start + step * index) for index in local_indices]
+
+    @staticmethod
+    def _read_rows(dataset, rows):
+        """Reads ``rows`` from ``dataset``, which must be increasing."""
+        if isinstance(rows, range):
+            if not len(rows):
+                return dataset[0:0]
+            return dataset[rows.start:rows.stop:rows.step]
+        if not rows:
+            return dataset[0:0]
+        if all(rows[i] + 1 == rows[i + 1] for i in range(len(rows) - 1)):
+            return dataset[rows[0]:rows[-1] + 1]
+        return dataset[numpy.array(rows)]
+
+    def _slice_plan(self, start, stop, step):
+        """Splits a slice into per-shard (local range, output position)."""
+        plans = []
+        for shard_index, (shard_start, shard_stop) in enumerate(
+                self._shard_bounds):
+            low = max(start, shard_start)
+            high = min(stop, shard_stop)
+            if low >= high:
+                continue
+            # Smallest index of the progression that is >= low.
+            first = start + ((low - start + step - 1) // step) * step
+            if first >= high:
+                continue
+            num = (high - 1 - first) // step + 1
+            last = first + (num - 1) * step
+            local = range(first - shard_start, last - shard_start + 1, step)
+            # Output positions are contiguous: they advance by one per
+            # requested index.
+            plans.append((shard_index, local, (first - start) // step, num))
+        return plans
+
+    # -- Handles -------------------------------------------------------------
+
+    def _acquire_handle(self, shard_index):
+        if shard_index in self._external_handles:
+            return self._external_handles[shard_index], None
+        path = self.shard_files[shard_index]
+        return self._handle_pool.acquire(path, self.driver), path
+
+    def _release_handle(self, lease):
+        if lease is not None:
+            self._handle_pool.release(lease)
+
+    # -- Dataset interface ---------------------------------------------------
+
+    @property
+    def data_sources(self):
+        if self.load_in_memory and self._data_sources is None:
+            self.load()
+        return self._data_sources
+
+    @property
+    def source_shapes(self):
+        if self.load_in_memory and self._source_shapes is None:
+            self.load()
+        return self._source_shapes
+
+    def load(self):
+        """Loads the selected data in memory when ``load_in_memory`` is set."""
+        if not self.load_in_memory:
+            self._data_sources = None
+            self._source_shapes = None
+            return
+        # Read the subset itself rather than the whole dataset followed by a
+        # selection, so that only the requested examples are loaded.
+        kind, value = self._translate_request(slice(None))
+        if kind == 'int':
+            data, shapes = self._read_int(value)
+            data = [numpy.array([source_data]) for source_data in data]
+            shapes = [None if source_shapes is None
+                      else numpy.array([source_shapes])
+                      for source_shapes in shapes]
+        else:
+            data, shapes = self._read(kind, value)
+        self._data_sources = tuple(data)
+        self._source_shapes = tuple(shapes)
+
+    def open(self):
+        if self.load_in_memory:
+            return None
+        self._handle_pool.open_state()
+        return _ShardState(self.max_open_files)
+
+    def close(self, state):
+        if self.load_in_memory:
+            return
+        # Leases are per-request, so a stream holds no handle while idle.
+        # When the last stream closes, idle cached handles are released.
+        if state is not None:
+            self._handle_pool.close_state()
+        else:
+            self._handle_pool.close_idle_if_unused()
+
+    def get_data(self, state=None, request=None):
+        if self.load_in_memory:
+            data, shapes = self._in_memory_get_data(state, request)
+        else:
+            data, shapes = self._out_of_memory_get_data(state, request)
+        for i in range(len(data)):
+            if shapes[i] is not None:
+                if isinstance(request, numbers.Integral):
+                    data[i] = data[i].reshape(shapes[i])
+                else:
+                    for j in range(len(data[i])):
+                        data[i][j] = data[i][j].reshape(shapes[i][j])
+        return tuple(data)
+
+    def _in_memory_get_data(self, state=None, request=None):
+        if state is not None or request is None:
+            raise ValueError
+        if not isinstance(request, (numbers.Integral, slice, list)):
+            raise ValueError
+        identity = Subset(slice(None), self.num_examples)
+        data = [identity.index_within_subset(data_source, request)
+                for data_source in self.data_sources]
+        shapes = [None if shape is None else
+                  identity.index_within_subset(shape, request)
+                  for shape in self.source_shapes]
+        return data, shapes
+
+    def _out_of_memory_get_data(self, state=None, request=None):
+        if not isinstance(request, (numbers.Integral, slice, list)):
+            raise ValueError()
+        kind, value = self._translate_request(request)
+        if kind == 'int':
+            data, shapes = self._read_int(value)
+        else:
+            data, shapes = self._read(kind, value)
+        return data, shapes
+
+    # -- Reading -------------------------------------------------------------
+
+    def _allocate(self, num_requested):
+        data = []
+        shapes = []
+        for source in self.sources:
+            if source in self._vlen_set:
+                data.append(numpy.empty((num_requested,), dtype='object'))
+                shapes.append(numpy.empty(
+                    (num_requested,) + self._vlen_shape_shapes[source],
+                    dtype='int64'))
+            else:
+                data.append(numpy.empty(
+                    (num_requested,) + self._element_shapes[source],
+                    dtype=self._numpy_dtypes[source]))
+                shapes.append(None)
+        return data, shapes
+
+    def _read_int(self, global_index):
+        shard_index, local_index = self._locate(global_index)
+        handle, lease = self._acquire_handle(shard_index)
+        data = []
+        shapes = []
+        try:
+            for source in self.sources:
+                subset = self._shard_subsets[source][shard_index]
+                rows = self._map_rows(subset, [local_index])
+                data.append(self._read_rows(handle[source], rows)[0])
+                if source in self._vlen_set:
+                    shapes.append(self._read_rows(
+                        handle[source].dims[0]['shapes'], rows)[0])
+                else:
+                    shapes.append(None)
+        finally:
+            self._release_handle(lease)
+        return data, shapes
+
+    def _read(self, kind, value):
+        """Reads a translated list or slice request.
+
+        The returned arrays follow the order of the request. All sources of
+        an example, including its variable-length shape, come from the same
+        shard row.
+
+        """
+        if kind == 'list':
+            num_requested = len(value)
+            per_shard = OrderedDict()
+            for position, global_index in enumerate(value):
+                shard_index, local_index = self._locate(global_index)
+                per_shard.setdefault(shard_index, []).append(
+                    (local_index, position))
+            plans = None
+        else:
+            start, stop, step = value
+            num_requested = len(range(start, stop, step))
+            per_shard = None
+            plans = self._slice_plan(start, stop, step)
+
+        data, shapes = self._allocate(num_requested)
+
+        if kind == 'list':
+            for shard_index, entries in per_shard.items():
+                handle, lease = self._acquire_handle(shard_index)
+                try:
+                    # Read every distinct local index once, in increasing
+                    # order as required by HDF5 fancy indexing.
+                    local_indices = sorted(set(index for index, _ in entries))
+                    slots = {index: slot for slot, index in
+                             enumerate(local_indices)}
+                    for source_index, source in enumerate(self.sources):
+                        subset = self._shard_subsets[source][shard_index]
+                        rows = self._map_rows(subset, local_indices)
+                        values = self._read_rows(handle[source], rows)
+                        if shapes[source_index] is not None:
+                            value_shapes = self._read_rows(
+                                handle[source].dims[0]['shapes'], rows)
+                        else:
+                            value_shapes = None
+                        for local_index, position in entries:
+                            slot = slots[local_index]
+                            data[source_index][position] = values[slot]
+                            if value_shapes is not None:
+                                shapes[source_index][position] = \
+                                    value_shapes[slot]
+                finally:
+                    self._release_handle(lease)
+            return data, shapes
+
+        for shard_index, local, position, num in plans:
+            handle, lease = self._acquire_handle(shard_index)
+            try:
+                for source_index, source in enumerate(self.sources):
+                    subset = self._shard_subsets[source][shard_index]
+                    rows = self._map_rows(subset, local)
+                    data[source_index][position:position + num] = \
+                        self._read_rows(handle[source], rows)
+                    if shapes[source_index] is not None:
+                        shapes[source_index][position:position + num] = \
+                            self._read_rows(
+                                handle[source].dims[0]['shapes'], rows)
+            finally:
+                self._release_handle(lease)
         return data, shapes

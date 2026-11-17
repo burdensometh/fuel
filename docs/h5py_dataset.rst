@@ -501,5 +501,77 @@ The object returned by ``get_data`` is a 1D numpy array of objects:
    >>> os.remove('test_targets.npy')
    >>> os.remove('dataset.hdf5')
 
+Sharded datasets
+----------------
+
+A training set is sometimes split over several HDF5 files, for instance when
+it doesn't fit in a single file or when it is produced in parallel. The
+:class:`~.datasets.hdf5.ShardedH5PYDataset` class exposes such a collection of
+shards as a single dataset that can be sampled exactly like an
+:class:`~.datasets.hdf5.H5PYDataset`.
+
+.. doctest::
+   :hide:
+
+   >>> numpy.random.seed(1234)
+
+>>> import h5py
+>>> from fuel.datasets.hdf5 import H5PYDataset, ShardedH5PYDataset
+>>> shard_paths = []
+>>> for shard_index, num_examples in enumerate([40, 60]):
+...     path = 'shard_{}.hdf5'.format(shard_index)
+...     f = h5py.File(path, mode='w')
+...     f['vector_features'] = numpy.random.normal(
+...         size=(num_examples, 10)).astype('float32')
+...     f['targets'] = numpy.random.randint(
+...         10, size=(num_examples, 1)).astype('uint8')
+...     f['vector_features'].dims[0].label = 'batch'
+...     f['vector_features'].dims[1].label = 'feature'
+...     f['targets'].dims[0].label = 'batch'
+...     f['targets'].dims[1].label = 'index'
+...     f.attrs['split'] = H5PYDataset.create_split_array({
+...         'train': {'vector_features': (0, 30), 'targets': (0, 30)},
+...         'test': {'vector_features': (30, num_examples),
+...                  'targets': (30, num_examples)}})
+...     f.flush()
+...     f.close()
+...     shard_paths.append(path)
+
+Shards are given in order, each with the split(s) it should contribute. The
+resulting dataset indexes the concatenation of the shards:
+
+>>> train_set = ShardedH5PYDataset(
+...     [(shard_paths[0], 'train'), (shard_paths[1], 'train')])
+>>> print(train_set.num_examples)
+60
+>>> print(train_set.shard_num_examples)
+(30, 30)
+
+Integer, slice and list requests all work. List requests may contain
+duplicated or unsorted indices, and the output always follows the request
+order. Every source of an example, including variable-length shapes, comes
+from that same example.
+
+>>> handle = train_set.open()
+>>> data = train_set.get_data(handle, [59, 0, 30, 0])
+>>> print((data[0].shape, data[1].shape))
+((4, 1), (4, 10))
+>>> train_set.close(handle)
+
+Shards must agree on their sources, dtypes and axis semantics; otherwise a
+:class:`ValueError` is raised. A shard that contributes no example for its
+selected split is simply skipped.
+
+Data is read from disk on demand: a request only opens the shards it needs.
+Pass ``max_open_files`` to bound how many files are open at once. Closing one
+stream never closes a file that another stream is still reading from.
+
+.. doctest::
+   :hide:
+
+   >>> import os
+   >>> for path in shard_paths:
+   ...     os.remove(path)
+
 .. _dimension scales: http://docs.h5py.org/en/latest/high/dims.html
 .. _dedicated tutorial on variable-length data: http://docs.h5py.org/en/latest/special.html#arbitrary-vlen-data

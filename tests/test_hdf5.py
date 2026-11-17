@@ -6,7 +6,8 @@ import numpy
 from numpy.testing import assert_equal, assert_raises
 from six.moves import range, cPickle
 
-from fuel.datasets.hdf5 import PytablesDataset, H5PYDataset
+from fuel.datasets.hdf5 import (PytablesDataset, H5PYDataset,
+                                ShardedH5PYDataset)
 from fuel.streams import DataStream
 from fuel.schemes import SequentialScheme
 
@@ -438,3 +439,387 @@ class TestH5PYDataset(object):
         except IOError:
             assert False
         dataset.close(None)
+
+
+class TestShardedH5PYDataset(object):
+    def setUp(self):
+        self.directory = 'sharded_hdf5'
+        if not os.path.isdir(self.directory):
+            os.mkdir(self.directory)
+        # Shard 0 contributes 12 examples, shard 1 contributes 20 and shard 2
+        # contributes none, so that empty shards are exercised too.
+        self.features = {}
+        self.targets = {}
+        self.paths = []
+        for index, num_rows in enumerate((20, 30, 5)):
+            path = os.path.join(self.directory, 'shard_{}.hdf5'.format(index))
+            features = numpy.arange(num_rows * 4, dtype='uint16').reshape(
+                num_rows, 4) + 1000 * index
+            targets = ((numpy.arange(num_rows) + 100 * index) % 256).astype(
+                'uint8').reshape(num_rows, 1)
+            h5file = h5py.File(path, mode='w')
+            h5file['features'] = features
+            h5file['features'].dims[0].label = 'batch'
+            h5file['features'].dims[1].label = 'feature'
+            h5file['targets'] = targets
+            h5file['targets'].dims[0].label = 'batch'
+            h5file['targets'].dims[1].label = 'index'
+            splits = {
+                'train': {'features': (0, 12), 'targets': (0, 12)},
+                'test': {'features': (12, num_rows),
+                         'targets': (12, num_rows)}}
+            if index == 2:
+                # A valid but empty split, to exercise skipped shards.
+                splits = {'train': {'features': (0, 0), 'targets': (0, 0)},
+                          'test': {'features': (0, num_rows),
+                                   'targets': (0, num_rows)}}
+            h5file.attrs['split'] = H5PYDataset.create_split_array(splits)
+            h5file.close()
+            self.features[index] = features
+            self.targets[index] = targets
+            self.paths.append(path)
+
+    def tearDown(self):
+        for path in self.paths:
+            os.remove(path)
+        os.rmdir(self.directory)
+
+    def _make_dataset(self, **kwargs):
+        kwargs.setdefault('shards', [
+            (self.paths[0], 'train'), (self.paths[1], 'train')])
+        return ShardedH5PYDataset(**kwargs)
+
+    def _expected(self):
+        features = numpy.concatenate(
+            [self.features[0][:12], self.features[1][:12]])
+        targets = numpy.concatenate(
+            [self.targets[0][:12], self.targets[1][:12]])
+        return features, targets
+
+    def test_num_examples_and_shard_layout(self):
+        dataset = self._make_dataset()
+        assert dataset.num_examples == 24
+        assert dataset.shard_num_examples == (12, 12)
+        assert dataset.shard_files == (self.paths[0], self.paths[1])
+        assert dataset.shard_splits == (('train',), ('train',))
+
+    def test_integer_request(self):
+        dataset = self._make_dataset()
+        features, targets = self._expected()
+        handle = dataset.open()
+        for index in (0, 11, 12, 23):
+            data = dataset.get_data(handle, index)
+            assert_equal(data[0], features[index])
+            assert_equal(data[1], targets[index])
+        dataset.close(handle)
+
+    def test_slice_request_spanning_shards(self):
+        dataset = self._make_dataset()
+        features, targets = self._expected()
+        handle = dataset.open()
+        request = slice(10, 15)
+        data = dataset.get_data(handle, request)
+        assert_equal(data[0], features[request])
+        assert_equal(data[1], targets[request])
+        dataset.close(handle)
+
+    def test_slice_request_with_step(self):
+        dataset = self._make_dataset()
+        features, targets = self._expected()
+        handle = dataset.open()
+        for request in (slice(0, 24, 3), slice(1, 23, 5), slice(11, 13)):
+            data = dataset.get_data(handle, request)
+            assert_equal(data[0], features[request])
+            assert_equal(data[1], targets[request])
+        dataset.close(handle)
+
+    def test_unsorted_and_duplicated_list_request(self):
+        dataset = self._make_dataset()
+        features, targets = self._expected()
+        handle = dataset.open()
+        request = [23, 0, 12, 0, 11, 23, 5]
+        data = dataset.get_data(handle, request)
+        assert_equal(data[0], features[request])
+        assert_equal(data[1], targets[request])
+        dataset.close(handle)
+
+    def test_different_split_per_shard(self):
+        dataset = ShardedH5PYDataset(
+            [(self.paths[0], 'train'), (self.paths[1], 'test')])
+        features = numpy.concatenate(
+            [self.features[0][:12], self.features[1][12:]])
+        targets = numpy.concatenate(
+            [self.targets[0][:12], self.targets[1][12:]])
+        assert dataset.num_examples == 30
+        assert dataset.shard_num_examples == (12, 18)
+        handle = dataset.open()
+        request = [29, 12, 0, 12]
+        data = dataset.get_data(handle, request)
+        assert_equal(data[0], features[request])
+        assert_equal(data[1], targets[request])
+        dataset.close(handle)
+
+    def test_default_which_sets(self):
+        dataset = ShardedH5PYDataset(self.paths[:2], which_sets='train')
+        assert dataset.num_examples == 24
+
+    def test_dict_of_shards(self):
+        dataset = ShardedH5PYDataset(
+            {self.paths[0]: 'train', self.paths[1]: 'test'})
+        assert dataset.num_examples == 30
+        assert dataset.shard_splits == (('train',), ('test',))
+
+    def test_empty_shard_is_skipped(self):
+        # Shard 2's train split is (0, 12) on a 5-row dataset, i.e. empty.
+        dataset = ShardedH5PYDataset(
+            [(self.paths[0], 'train'), (self.paths[2], 'train'),
+             (self.paths[1], 'train')])
+        assert dataset.shard_num_examples == (12, 0, 12)
+        assert dataset.num_examples == 24
+        features, targets = self._expected()
+        handle = dataset.open()
+        request = [0, 12, 23]
+        data = dataset.get_data(handle, request)
+        assert_equal(data[0], features[request])
+        assert_equal(data[1], targets[request])
+        dataset.close(handle)
+
+    def test_subset(self):
+        dataset = self._make_dataset(subset=[20, 2, 13])
+        features, targets = self._expected()
+        assert dataset.num_examples == 3
+        handle = dataset.open()
+        # List-based subsets are sorted, like `H5PYDataset`.
+        data = dataset.get_data(handle, slice(0, 3))
+        assert_equal(data[0], features[[2, 13, 20]])
+        assert_equal(data[1], targets[[2, 13, 20]])
+        dataset.close(handle)
+
+    def test_sources_argument(self):
+        dataset = self._make_dataset(sources=('targets', 'features'))
+        assert dataset.sources == ('targets', 'features')
+        handle = dataset.open()
+        data = dataset.get_data(handle, 0)
+        assert data[0].shape == (1,)
+        assert data[1].shape == (4,)
+        dataset.close(handle)
+
+    def test_rejects_incompatible_dtypes(self):
+        path = os.path.join(self.directory, 'bad_dtype.hdf5')
+        h5file = h5py.File(path, mode='w')
+        h5file['features'] = numpy.zeros((4, 4), dtype='float32')
+        h5file['features'].dims[0].label = 'batch'
+        h5file['features'].dims[1].label = 'feature'
+        h5file['targets'] = numpy.zeros((4, 1), dtype='uint8')
+        h5file['targets'].dims[0].label = 'batch'
+        h5file['targets'].dims[1].label = 'index'
+        h5file.attrs['split'] = H5PYDataset.create_split_array(
+            {'train': {'features': (0, 4), 'targets': (0, 4)}})
+        h5file.close()
+        try:
+            assert_raises(
+                ValueError, ShardedH5PYDataset,
+                [(self.paths[0], 'train'), (path, 'train')])
+        finally:
+            os.remove(path)
+
+    def test_rejects_incompatible_sources(self):
+        path = os.path.join(self.directory, 'bad_sources.hdf5')
+        h5file = h5py.File(path, mode='w')
+        h5file['features'] = numpy.zeros((4, 4), dtype='uint16')
+        h5file['features'].dims[0].label = 'batch'
+        h5file['features'].dims[1].label = 'feature'
+        h5file['labels'] = numpy.zeros((4, 1), dtype='uint8')
+        h5file['labels'].dims[0].label = 'batch'
+        h5file['labels'].dims[1].label = 'index'
+        h5file.attrs['split'] = H5PYDataset.create_split_array(
+            {'train': {'features': (0, 4), 'labels': (0, 4)}})
+        h5file.close()
+        try:
+            assert_raises(
+                ValueError, ShardedH5PYDataset,
+                [(self.paths[0], 'train'), (path, 'train')])
+        finally:
+            os.remove(path)
+
+    def test_rejects_incompatible_axis_labels(self):
+        path = os.path.join(self.directory, 'bad_labels.hdf5')
+        h5file = h5py.File(path, mode='w')
+        h5file['features'] = numpy.zeros((4, 4), dtype='uint16')
+        h5file['features'].dims[0].label = 'batch'
+        h5file['features'].dims[1].label = 'pixel'
+        h5file['targets'] = numpy.zeros((4, 1), dtype='uint8')
+        h5file['targets'].dims[0].label = 'batch'
+        h5file['targets'].dims[1].label = 'index'
+        h5file.attrs['split'] = H5PYDataset.create_split_array(
+            {'train': {'features': (0, 4), 'targets': (0, 4)}})
+        h5file.close()
+        try:
+            assert_raises(
+                ValueError, ShardedH5PYDataset,
+                [(self.paths[0], 'train'), (path, 'train')])
+        finally:
+            os.remove(path)
+
+    def test_raises_when_all_shards_are_empty(self):
+        assert_raises(
+            ValueError, ShardedH5PYDataset,
+            [(self.paths[2], 'train')])
+
+    def test_raises_on_missing_split(self):
+        assert_raises(
+            ValueError, ShardedH5PYDataset, [(self.paths[0], 'nope')])
+
+    def test_raises_on_out_of_range_index(self):
+        dataset = self._make_dataset()
+        handle = dataset.open()
+        assert_raises(ValueError, dataset.get_data, handle, 24)
+        assert_raises(ValueError, dataset.get_data, handle, -1)
+        dataset.close(handle)
+
+    def test_out_of_memory_only_reads_requested_shard(self):
+        dataset = self._make_dataset(max_open_files=1)
+        handle = dataset.open()
+        dataset.get_data(handle, 0)
+        assert len(dataset._handle_pool._handles) == 1
+        # The handle is not held while no request is in flight.
+        assert dataset._handle_pool._ref_counts == {}
+        dataset.close(handle)
+
+    def test_max_open_files_bound(self):
+        paths = [self.paths[0], self.paths[1]]
+        dataset = ShardedH5PYDataset(
+            [(path, 'train') for path in paths], max_open_files=1)
+        handle = dataset.open()
+        # Reading indices from both shards in a single request still works
+        # and the pool never holds more than one file.
+        dataset.get_data(handle, [0, 20])
+        assert len(dataset._handle_pool._handles) <= 1
+        dataset.close(handle)
+
+    def test_closing_one_stream_does_not_break_another(self):
+        dataset = self._make_dataset()
+        features, targets = self._expected()
+        stream_1 = DataStream(dataset, iteration_scheme=SequentialScheme(
+            dataset.num_examples, 4))
+        stream_2 = DataStream(dataset, iteration_scheme=SequentialScheme(
+            dataset.num_examples, 4))
+        iterator_1 = stream_1.get_epoch_iterator()
+        iterator_2 = stream_2.get_epoch_iterator()
+        next(iterator_1)
+        next(iterator_2)
+        stream_1.close()
+        data = next(iterator_2)
+        assert_equal(data[0], features[4:8])
+        assert_equal(data[1], targets[4:8])
+        stream_2.close()
+
+    def test_pickling(self):
+        dataset = self._make_dataset()
+        unpickled = cPickle.loads(cPickle.dumps(dataset))
+        assert unpickled.num_examples == dataset.num_examples
+        features, targets = self._expected()
+        handle = unpickled.open()
+        request = [1, 13, 1]
+        data = unpickled.get_data(handle, request)
+        assert_equal(data[0], features[request])
+        assert_equal(data[1], targets[request])
+        unpickled.close(handle)
+
+    def test_pickling_stream(self):
+        dataset = self._make_dataset()
+        stream = DataStream(dataset, iteration_scheme=SequentialScheme(
+            dataset.num_examples, 4))
+        unpickled = cPickle.loads(cPickle.dumps(stream))
+        iterator = unpickled.get_epoch_iterator()
+        next(iterator)
+        stream.close()
+        unpickled.close()
+
+    def test_load_in_memory(self):
+        dataset = self._make_dataset(load_in_memory=True)
+        features, targets = self._expected()
+        assert dataset.data_sources[0].shape == (24, 4)
+        handle = dataset.open()
+        request = [22, 1, 22, 0]
+        data = dataset.get_data(handle, request)
+        assert_equal(data[0], features[request])
+        assert_equal(data[1], targets[request])
+        dataset.close(handle)
+
+    def test_load_in_memory_with_subset(self):
+        dataset = self._make_dataset(
+            load_in_memory=True, subset=slice(10, 15))
+        features, targets = self._expected()
+        handle = dataset.open()
+        data = dataset.get_data(handle, [4, 0, 4])
+        assert_equal(data[0], features[[14, 10, 14]])
+        assert_equal(data[1], targets[[14, 10, 14]])
+        dataset.close(handle)
+
+    def test_example_stream(self):
+        dataset = self._make_dataset()
+        features, targets = self._expected()
+        iterator = dataset.get_example_stream().get_epoch_iterator()
+        for index in range(3):
+            data = next(iterator)
+            assert_equal(data[0], features[index])
+            assert_equal(data[1], targets[index])
+
+    def test_variable_length_shapes_match_example(self):
+        images = {
+            0: [numpy.arange(12, dtype='uint8').reshape(3, 2, 2),
+                numpy.arange(24, dtype='uint8').reshape(3, 4, 2)],
+            1: [numpy.arange(30, dtype='uint8').reshape(3, 5, 2),
+                numpy.arange(18, dtype='uint8').reshape(3, 3, 2),
+                numpy.arange(6, dtype='uint8').reshape(3, 1, 2)]}
+        paths = []
+        for index, shard_images in images.items():
+            path = os.path.join(
+                self.directory, 'vlen_{}.hdf5'.format(index))
+            h5file = h5py.File(path, mode='w')
+            dtype = h5py.special_dtype(vlen=numpy.dtype('uint8'))
+            features = h5file.create_dataset(
+                'features', (len(shard_images),), dtype=dtype)
+            features[...] = [image.flatten() for image in shard_images]
+            features.dims[0].label = 'batch'
+            shapes = h5file.create_dataset(
+                'features_shapes', (len(shard_images), 3), dtype='int32')
+            shapes[...] = numpy.array(
+                [image.shape for image in shard_images])
+            features.dims.create_scale(shapes, 'shapes')
+            features.dims[0].attach_scale(shapes)
+            labels = h5file.create_dataset(
+                'features_shape_labels', (3,), dtype='S7')
+            labels[...] = [b'channel', b'height', b'width']
+            features.dims.create_scale(labels, 'shape_labels')
+            features.dims[0].attach_scale(labels)
+            targets = numpy.arange(
+                len(shard_images), dtype='uint8').reshape(
+                    len(shard_images), 1) + 10 * index
+            h5file['targets'] = targets
+            h5file['targets'].dims[0].label = 'batch'
+            h5file['targets'].dims[1].label = 'index'
+            h5file.attrs['split'] = H5PYDataset.create_split_array(
+                {'train': {'features': (0, len(shard_images)),
+                           'targets': (0, len(shard_images))}})
+            h5file.close()
+            paths.append(path)
+        try:
+            all_images = images[0] + images[1]
+            all_targets = numpy.concatenate([
+                numpy.arange(2, dtype='uint8') + 0,
+                numpy.arange(3, dtype='uint8') + 10]).reshape(5, 1)
+            dataset = ShardedH5PYDataset(
+                [(paths[0], 'train'), (paths[1], 'train')],
+                load_in_memory=False)
+            handle = dataset.open()
+            request = [4, 1, 4, 0, 2]
+            data = dataset.get_data(handle, request)
+            for value, index in zip(data[0], request):
+                assert_equal(value, all_images[index])
+            assert_equal(data[1], all_targets[request])
+            dataset.close(handle)
+        finally:
+            for path in paths:
+                os.remove(path)
